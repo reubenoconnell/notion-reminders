@@ -25,7 +25,7 @@ from email.mime.text import MIMEText
 from notion_client import Client
 
 # ---- Configuration: adjust to match your Notion database ----
-DATE_PROPERTY = "Due Date"
+DATE_PROPERTY = "Due date"
 STATUS_PROPERTY = "Status"
 STATUS_DONE_VALUES = ["Done", "Complete", "Completed"]
 TITLE_PROPERTY = "Name"
