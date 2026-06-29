@@ -28,7 +28,7 @@ from notion_client import Client
 DATE_PROPERTY = "Due date"
 STATUS_PROPERTY = "Status"
 STATUS_DONE_VALUES = ["Done", "Complete", "Completed"]
-TITLE_PROPERTY = "Name"
+TITLE_PROPERTY = "Task name"
 LOOKAHEAD_DAYS = 1  # 1 = include tomorrow's tasks too. 0 = today only.
 INCLUDE_OVERDUE = True
 
