@@ -1,26 +1,28 @@
 """
 Notion Task Due Date Reminder
 ------------------------------
-Queries a Notion database for tasks due today or tomorrow (or overdue),
-and emails a summary.
+Queries a Notion database for tasks due this week (today through Sunday),
+categorises them into today / tomorrow / later this week, and sends an
+HTML email summary.
 
-Environment variables required (set as GitHub Actions secrets):
+Environment variables (set as GitHub Actions secrets):
   NOTION_TOKEN        - Notion internal integration token
   NOTION_DATABASE_ID  - ID of the database to query
-  GMAIL_ADDRESS        - Gmail address to send FROM
-  GMAIL_APP_PASSWORD   - Gmail app password (not your normal password)
-  NOTIFY_EMAIL          - Email address to send TO (can be same as GMAIL_ADDRESS)
+  GMAIL_ADDRESS       - Gmail address to send FROM
+  GMAIL_APP_PASSWORD  - Gmail app password (not your normal password)
+  NOTIFY_EMAIL        - Email address to send TO
 
-Configuration (edit these to match your database schema):
-  DATE_PROPERTY     - name of the Date property in your Notion database
-  STATUS_PROPERTY   - name of the Status/Checkbox property
-  STATUS_DONE_VALUES - values that count as "done" (so they're excluded)
-  TITLE_PROPERTY    - name of the title property (usually "Name")
+Configuration (edit to match your Notion database schema):
+  DATE_PROPERTY      - name of the Date property
+  STATUS_PROPERTY    - name of the Status property
+  STATUS_DONE_VALUES - values that mean "finished" (excluded from results)
+  TITLE_PROPERTY     - name of the title property
 """
 
 import os
 import smtplib
 from datetime import datetime, timedelta, date
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from notion_client import Client
 
@@ -29,8 +31,6 @@ DATE_PROPERTY = "Due date"
 STATUS_PROPERTY = "Status"
 STATUS_DONE_VALUES = ["Done", "Complete", "Completed"]
 TITLE_PROPERTY = "Task name"
-LOOKAHEAD_DAYS = 1  # 1 = include tomorrow's tasks too. 0 = today only.
-INCLUDE_OVERDUE = True
 
 # ---- Load secrets from environment ----
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
@@ -40,17 +40,21 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
 
 
-def get_due_tasks():
+def end_of_week(today: date) -> date:
+    """Return the Sunday of the current week (or today if it's Sunday)."""
+    days_until_sunday = (6 - today.weekday()) % 7
+    return today + timedelta(days=days_until_sunday)
+
+
+def get_tasks(today: date, end_date: date):
     notion = Client(auth=NOTION_TOKEN)
 
-    today = date.today()
-    cutoff = today + timedelta(days=LOOKAHEAD_DAYS)
-
+    # Pull everything due on or before end of week, plus overdue
     results = notion.databases.query(
         database_id=NOTION_DATABASE_ID,
         filter={
             "property": DATE_PROPERTY,
-            "date": {"on_or_before": cutoff.isoformat()},
+            "date": {"on_or_before": end_date.isoformat()},
         },
         sorts=[{"property": DATE_PROPERTY, "direction": "ascending"}],
     )
@@ -59,7 +63,7 @@ def get_due_tasks():
     for page in results.get("results", []):
         props = page["properties"]
 
-        # Skip if marked done
+        # Skip completed tasks
         status_prop = props.get(STATUS_PROPERTY, {})
         status_value = None
         if status_prop.get("type") == "status":
@@ -89,9 +93,6 @@ def get_due_tasks():
 
         due_date = datetime.fromisoformat(due_date_str.split("T")[0]).date()
 
-        if due_date < today and not INCLUDE_OVERDUE:
-            continue
-
         tasks.append({
             "title": title_text,
             "due_date": due_date,
@@ -99,49 +100,185 @@ def get_due_tasks():
             "status": status_value or "No status",
         })
 
-    return tasks, today
+    return tasks
 
 
-def categorise(tasks, today):
-    overdue, due_today, due_soon = [], [], []
+def categorise(tasks, today: date):
+    tomorrow = today + timedelta(days=1)
+    overdue, due_today, due_tomorrow, due_later = [], [], [], []
+
     for t in tasks:
         if t["due_date"] < today:
             overdue.append(t)
         elif t["due_date"] == today:
             due_today.append(t)
+        elif t["due_date"] == tomorrow:
+            due_tomorrow.append(t)
         else:
-            due_soon.append(t)
-    return overdue, due_today, due_soon
+            due_later.append(t)
+
+    return overdue, due_today, due_tomorrow, due_later
 
 
-def build_email_body(overdue, due_today, due_soon):
-    lines = []
+# ---- HTML email builder ----
 
-    def add_section(title, items):
-        if not items:
-            return
-        lines.append(f"\n{title}")
-        lines.append("-" * len(title))
-        for t in items:
-            lines.append(f"  - {t['title']} (due {t['due_date'].strftime('%a %d %b')}) [{t['status']}]")
-            if t["url"]:
-                lines.append(f"    {t['url']}")
-
-    add_section(f"OVERDUE ({len(overdue)})", overdue)
-    add_section(f"DUE TODAY ({len(due_today)})", due_today)
-    add_section(f"DUE SOON ({len(due_soon)})", due_soon)
-
-    if not (overdue or due_today or due_soon):
-        return "No tasks due today, tomorrow, or overdue. Nothing to action."
-
-    return "\n".join(lines)
+COLORS = {
+    "overdue": "#C0392B",
+    "today": "#E67E22",
+    "tomorrow": "#2980B9",
+    "later": "#27AE60",
+    "bg": "#F4F5F7",
+    "card": "#FFFFFF",
+    "text": "#172B4D",
+    "muted": "#6B778C",
+    "border": "#DFE1E6",
+}
 
 
-def send_email(subject, body):
-    msg = MIMEText(body)
+def task_row(task, color):
+    date_str = task["due_date"].strftime("%a %d %b")
+    url = task["url"]
+    title = task["title"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    link = (
+        f'<a href="{url}" style="color:{color};text-decoration:none;font-weight:600;">{title}</a>'
+        if url
+        else f'<span style="font-weight:600;color:{COLORS["text"]};">{title}</span>'
+    )
+    return f"""
+        <tr>
+          <td style="padding:10px 16px;border-bottom:1px solid {COLORS['border']};">
+            {link}
+          </td>
+          <td style="padding:10px 16px;border-bottom:1px solid {COLORS['border']};
+                     text-align:right;white-space:nowrap;color:{COLORS['muted']};
+                     font-size:13px;">
+            {date_str}
+          </td>
+        </tr>"""
+
+
+def section_block(heading, badge_label, tasks, color):
+    if not tasks:
+        return ""
+    rows = "".join(task_row(t, color) for t in tasks)
+    count = len(tasks)
+    return f"""
+    <table width="100%" cellpadding="0" cellspacing="0" border="0"
+           style="margin-bottom:24px;border-radius:6px;overflow:hidden;
+                  border:1px solid {COLORS['border']};background:{COLORS['card']};">
+      <tr>
+        <td colspan="2" style="padding:12px 16px;background:{color};border-radius:6px 6px 0 0;">
+          <span style="color:#fff;font-weight:700;font-size:14px;
+                       font-family:Arial,sans-serif;letter-spacing:0.3px;">
+            {heading}
+          </span>
+          <span style="background:rgba(255,255,255,0.25);color:#fff;
+                       font-size:12px;font-weight:700;border-radius:10px;
+                       padding:2px 8px;margin-left:8px;">
+            {count}
+          </span>
+        </td>
+      </tr>
+      {rows}
+    </table>"""
+
+
+def build_html_email(overdue, due_today, due_tomorrow, due_later, today: date):
+    date_display = today.strftime("%A %d %B %Y")
+
+    body_content = (
+        section_block("Overdue", "overdue", overdue, COLORS["overdue"])
+        + section_block("Due Today", "today", due_today, COLORS["today"])
+        + section_block("Due Tomorrow", "tomorrow", due_tomorrow, COLORS["tomorrow"])
+        + section_block("Later This Week", "later", due_later, COLORS["later"])
+    )
+
+    total = len(overdue) + len(due_today) + len(due_tomorrow) + len(due_later)
+
+    if total == 0:
+        body_content = f"""
+        <p style="text-align:center;color:{COLORS['muted']};font-size:15px;padding:32px 0;">
+          No tasks due this week. Enjoy the clear runway.
+        </p>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>Task Reminder</title>
+</head>
+<body style="margin:0;padding:0;background:{COLORS['bg']};
+             font-family:Arial,Helvetica,sans-serif;color:{COLORS['text']};">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0"
+         style="background:{COLORS['bg']};padding:32px 16px;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" border="0"
+               style="max-width:600px;width:100%;">
+
+          <!-- Header -->
+          <tr>
+            <td style="padding-bottom:24px;">
+              <p style="margin:0;font-size:13px;color:{COLORS['muted']};
+                         text-transform:uppercase;letter-spacing:0.8px;">
+                Task Reminder
+              </p>
+              <h1 style="margin:4px 0 0;font-size:22px;font-weight:700;
+                          color:{COLORS['text']};">
+                {date_display}
+              </h1>
+            </td>
+          </tr>
+
+          <!-- Sections -->
+          <tr>
+            <td>
+              {body_content}
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding-top:16px;border-top:1px solid {COLORS['border']};">
+              <p style="margin:0;font-size:12px;color:{COLORS['muted']};text-align:center;">
+                Sent by your Notion Task Reminder &middot; Powered by GitHub Actions
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+def build_subject(overdue, due_today, due_tomorrow, due_later, today: date):
+    if overdue or due_today:
+        total_urgent = len(overdue) + len(due_today)
+        label = "task" if total_urgent == 1 else "tasks"
+        parts = []
+        if overdue:
+            parts.append(f"{len(overdue)} overdue")
+        if due_today:
+            parts.append(f"{len(due_today)} due today")
+        return f"Tasks due - {', '.join(parts)}"
+    elif due_tomorrow or due_later:
+        total = len(due_tomorrow) + len(due_later)
+        label = "task" if total == 1 else "tasks"
+        return f"Coming up this week - {total} {label}"
+    else:
+        return f"Task Reminder - all clear for {today.strftime('%a %d %b')}"
+
+
+def send_email(subject: str, html_body: str):
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = GMAIL_ADDRESS
     msg["To"] = NOTIFY_EMAIL
+    msg.attach(MIMEText(html_body, "html"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
@@ -149,15 +286,17 @@ def send_email(subject, body):
 
 
 def main():
-    tasks, today = get_due_tasks()
-    overdue, due_today, due_soon = categorise(tasks, today)
+    today = date.today()
+    end_date = end_of_week(today)
 
-    total = len(overdue) + len(due_today) + len(due_soon)
-    subject = f"Notion tasks: {total} due/overdue" if total else "Notion tasks: all clear"
+    tasks = get_tasks(today, end_date)
+    overdue, due_today, due_tomorrow, due_later = categorise(tasks, today)
 
-    body = build_email_body(overdue, due_today, due_soon)
-    send_email(subject, body)
-    print(f"Sent reminder email: {subject}")
+    subject = build_subject(overdue, due_today, due_tomorrow, due_later, today)
+    html_body = build_html_email(overdue, due_today, due_tomorrow, due_later, today)
+
+    send_email(subject, html_body)
+    print(f"Sent: {subject}")
 
 
 if __name__ == "__main__":
