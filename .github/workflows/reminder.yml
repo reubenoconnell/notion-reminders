@@ -1,25 +1,17 @@
 name: Notion Task Reminder
 
 on:
-  schedule:
-   - cron: "0 9 * * 1-5"
-  workflow_dispatch: {}  # allows manual trigger from the Actions tab for testing
+  workflow_dispatch: {}
 
 jobs:
   send-reminder:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Run reminder script
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
